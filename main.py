@@ -60,6 +60,10 @@ def setup_argparse():
     return parser.parse_args()
 
 
+# Exclusion patterns meet the paths exactly as the walk joined them,
+# absolute only if the scan root was absolute. A pattern anchored to
+# the scan root in the exclude file will not match a relative walk,
+# so the same exclude file behaves differently by invocation.
 def is_excluded(path, exclude_spec):
     """
     Checks if a given path is excluded based on the provided PathSpec.
@@ -137,6 +141,9 @@ def is_default_deny_candidate(resource_path):
     except KeyError:
         owner = str(info.st_uid)
     logging.debug(f"{resource_path}: mode {oct(mode)}, owner {owner}")
+    # Owner bits play no part in this test. A mode 700 file is never a
+    # candidate and a mode 020 file always is, because the question here
+    # is only what group and other can do implicitly.
     return bool(mode & 0o033)
 
 
@@ -279,6 +286,11 @@ def main():
             table.add_column("Rule", style="green")
 
             for i, resource in enumerate(denied_resources):
+              # If rule generation failed for an early resource, rules is shorter
+              # than denied_resources and this index pairing shifts: later rows
+              # carry the wrong rule text, and the last row raises IndexError into
+              # the outer handler. The console table trusts an alignment the file
+              # output path does not need.
               table.add_row(resource, rules[i])
 
             console.print(table)
