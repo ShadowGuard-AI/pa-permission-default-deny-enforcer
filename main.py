@@ -1,8 +1,10 @@
 import argparse
 import logging
 import os
+import pwd
 import json
 import stat  # Import the stat module
+import sys
 
 from pathspec import PathSpec
 from pathspec.patterns import GitWildMatchPattern
@@ -20,7 +22,7 @@ def setup_argparse():
     Sets up the argument parser for the command-line interface.
     """
     parser = argparse.ArgumentParser(
-        description="Analyzes permissions and generates 'default deny' rules."
+        description="Analyzes permissions and generates draft 'default deny' rule text templates. The rules are not applied by this tool; they must be adapted and applied by hand."
     )
 
     parser.add_argument(
@@ -80,48 +82,80 @@ def analyze_permissions(path, exclude_spec=None):
     """
 
     denied_resources = []
+    scanned = 0
 
     if not os.path.exists(path):
         logging.error(f"Path '{path}' does not exist.")
-        return denied_resources
+        return denied_resources, scanned
 
     if os.path.isfile(path):
         if not is_excluded(path, exclude_spec):
-            permissions = check_file_permissions(path)
-            if not permissions['read'] or not permissions['write']:
-              denied_resources.append(path)
-        return denied_resources
+            scanned += 1
+            if is_default_deny_candidate(path):
+                denied_resources.append(path)
+        return denied_resources, scanned
 
-    for root, _, files in os.walk(path):
-        for file in files:
-            full_path = os.path.join(root, file)
-            if not is_excluded(full_path, exclude_spec):
-                permissions = check_file_permissions(full_path)
-                if not permissions['read'] or not permissions['write']:
-                    denied_resources.append(full_path)
+    if os.path.isdir(path):
+        # The target directory itself is the scan root, not a scanned
+        # resource: an empty directory therefore scans nothing and the
+        # caller exits 1. Subdirectories found in the walk are scanned
+        # resources and are tested as candidates like files.
+        for root, dirs, files in os.walk(path):
+            for name in dirs:
+                full_path = os.path.join(root, name)
+                if not is_excluded(full_path, exclude_spec):
+                    scanned += 1
+                    if is_default_deny_candidate(full_path):
+                        denied_resources.append(full_path)
+            for file in files:
+                full_path = os.path.join(root, file)
+                if not is_excluded(full_path, exclude_spec):
+                    scanned += 1
+                    if is_default_deny_candidate(full_path):
+                        denied_resources.append(full_path)
 
-    return denied_resources
+    return denied_resources, scanned
+
+
+def is_default_deny_candidate(resource_path):
+    """
+    Caller independent candidate test, computed from mode bits and
+    ownership read with os.stat. A resource is a candidate when it
+    carries broad implicit access: write or execute permission bits
+    for the group or for others (mode bits 0o033). Read only access
+    for group and others, such as mode 0444, is not a candidate.
+    Directories are tested the same way as files.
+    """
+    try:
+        info = os.stat(resource_path)
+    except OSError as e:
+        logging.error(f"Error checking permissions for {resource_path}: {e}")
+        return False
+    mode = stat.S_IMODE(info.st_mode)
+    try:
+        owner = pwd.getpwuid(info.st_uid).pw_name
+    except KeyError:
+        owner = str(info.st_uid)
+    logging.debug(f"{resource_path}: mode {oct(mode)}, owner {owner}")
+    return bool(mode & 0o033)
 
 
 def check_file_permissions(file_path):
     """
-    Checks read and write permissions for a given file.
+    Returns the mode bits and owner for a given resource, read with
+    os.stat. Kept for callers that need the raw facts; the candidate
+    test above does not use the calling user's access.
     """
-    permissions = {'read': False, 'write': False}
-
     try:
-        # Check if the file is readable
-        if os.access(file_path, os.R_OK):
-            permissions['read'] = True
-
-        # Check if the file is writable
-        if os.access(file_path, os.W_OK):
-            permissions['write'] = True
-
+        info = os.stat(file_path)
+        try:
+            owner = pwd.getpwuid(info.st_uid).pw_name
+        except KeyError:
+            owner = str(info.st_uid)
+        return {'mode': stat.S_IMODE(info.st_mode), 'owner': owner}
     except OSError as e:
         logging.error(f"Error checking permissions for {file_path}: {e}")
-
-    return permissions
+        return {'mode': 0, 'owner': None}
 
 
 def load_exclude_patterns(exclude_file):
@@ -154,11 +188,11 @@ def generate_default_deny_rule(resource, format, owner=None):
     """
 
     if format == "acl":
-        return f"# Default Deny ACL for {resource}" + os.linesep + f"deny all@{os.path.dirname(resource)} {os.path.basename(resource)}"
+        return f"# Draft text template, default deny ACL sketch for {resource}. Not a valid rule for any named system as written; adapt and apply by hand." + os.linesep + f"deny all@{os.path.dirname(resource)} {os.path.basename(resource)}"
     elif format == "iam":
         if owner is None:
             raise ValueError("Owner must be specified for IAM format.")
-        return json.dumps({
+        return "# Draft text template: the IAM sketch below is not a valid IAM policy as written, because a local path is not an ARN. Adapt it and apply it by hand." + os.linesep + json.dumps({
             "Version": "2012-10-17",
             "Statement": [
                 {
@@ -173,33 +207,51 @@ def generate_default_deny_rule(resource, format, owner=None):
         raise ValueError(f"Unsupported format: {format}")
 
 
+DRAFT_HEADER = "# Draft text template: generated by pa-permission-default-deny-enforcer. These are draft rule sketches, not valid rules for a named system as written, and nothing was applied. Adapt and apply them by hand.\n"
+
+
 def main():
     """
     Main function to orchestrate the permission analysis and rule generation.
+    Returns an exit code: 1 on errors and on scans that scanned nothing,
+    0 otherwise.
     """
     args = setup_argparse()
 
     # Input validation
     if not os.path.exists(args.path):
         console.print(f"[red]Error: Path '{args.path}' does not exist.[/red]")
-        return
+        return 1
 
     if args.format == "iam" and args.owner is None:
         console.print("[red]Error: --owner must be specified when using IAM format.[/red]")
-        return
+        return 1
 
     try:
         exclude_spec = load_exclude_patterns(args.exclude) if args.exclude else None
     except Exception as e:
         console.print(f"[red]Error loading exclude patterns: {e}[/red]")
-        return
-    
+        return 1
+
     try:
-        denied_resources = analyze_permissions(args.path, exclude_spec)
+        denied_resources, scanned = analyze_permissions(args.path, exclude_spec)
+
+        if scanned == 0:
+            console.print("[red]Error: Nothing was scanned at the named path.[/red]")
+            return 1
 
         if not denied_resources:
-            console.print("[green]No resources found lacking explicit permission grants.[/green]")
-            return
+            console.print("[green]No resources found carrying broad implicit access. No rules were generated.[/green]")
+            if args.output:
+                try:
+                    with open(args.output, "w") as f:
+                        f.write(DRAFT_HEADER)
+                        f.write("# No rules were generated: no candidate resources were found in this scan.\n")
+                    console.print(f"[green]Comment only rules file written to '{args.output}'.[/green]")
+                except Exception as e:
+                    console.print(f"[red]Error writing to output file: {e}[/red]")
+                    return 1
+            return 0
 
         rules = []
         for resource in denied_resources:
@@ -213,13 +265,16 @@ def main():
         if args.output:
             try:
                 with open(args.output, "w") as f:
+                    f.write(DRAFT_HEADER)
                     for rule in rules:
                         f.write(rule + os.linesep)
-                console.print(f"[green]Default deny rules written to '{args.output}'.[/green]")
+                console.print(f"[green]Draft default deny rule templates written to '{args.output}'. Nothing was applied.[/green]")
             except Exception as e:
                 console.print(f"[red]Error writing to output file: {e}[/red]")
+                return 1
         else:
-            table = Table(title="Default Deny Rules", show_header=True, header_style="bold magenta")
+            console.print("Draft text templates only. Nothing was applied; adapt and apply by hand.")
+            table = Table(title="Default Deny Rules (draft templates)", show_header=True, header_style="bold magenta")
             table.add_column("Resource", style="dim")
             table.add_column("Rule", style="green")
 
@@ -231,7 +286,9 @@ def main():
     except Exception as e:
         console.print(f"[red]An unexpected error occurred: {e}[/red]")
         logging.exception("An unexpected error occurred")
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
